@@ -6,6 +6,9 @@
 #include "Emu/RSX/gcm_enums.h"
 #include "Utilities/StrFmt.h"
 
+#include <array>
+#include <atomic>
+
 namespace program_common
 {
 	template <typename T>
@@ -39,6 +42,13 @@ namespace program_common
 
 namespace glsl
 {
+	namespace
+	{
+		// Preserve the first unexpected shader function warning, but suppress
+		// the flood of identical follow-up entries that can dominate the log.
+		std::array<std::atomic_bool, 128> g_logged_unexpected_functions{};
+	}
+
 	std::string getFloatTypeNameImpl(usz elementCount)
 	{
 		switch (elementCount)
@@ -563,7 +573,13 @@ namespace glsl
 			return "texelFetch($t, ivec2($0.xy * textureSize($t)), 0)";
 		}
 
-		rsx_log.error("Unexpected function request: %d", static_cast<int>(f));
+		const usz index = static_cast<usz>(f);
+
+		if (index >= g_logged_unexpected_functions.size() || !g_logged_unexpected_functions[index].exchange(true, std::memory_order_relaxed))
+		{
+			rsx_log.error("Unexpected function request: %d (further occurrences suppressed)", static_cast<int>(f));
+		}
+
 		return "$Ty(0.)";
 	}
 

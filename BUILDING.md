@@ -116,6 +116,98 @@ git submodule update --init --recursive
 
 ### Windows
 
+#### Quick local PowerShell pipeline
+
+If you want a repeatable local build from the command line without opening Visual Studio first, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-RPCS3.ps1 -Pipeline MSBuild -Configuration Release -SyncSubmodules
+```
+
+The script will:
+- validate `QTDIR`/`Qt6_ROOT` and `VULKAN_SDK` (or auto-detect the default install folders `C:\Qt\6.10.2\msvc2022_64`, `C:\VulkanSDK\1.3.268.0`, and `C:\Projects\SDKs\VulkanSDK\1.3.268.0`)
+- optionally sync submodules when the checkout is a real git clone
+- restore NuGet packages
+- build `rpcs3.sln` with `msbuild`
+
+You can also use the CMake preset path instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-RPCS3.ps1 -Pipeline CMake -Configuration Release
+```
+
+#### Local MGS4 tuning helper
+
+For a repeatable Metal Gear Solid 4 baseline on a high-end Windows desktop, you can generate per-title custom configs under `.\bin\config\custom_configs\` with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Set-MGS4-Profile.ps1
+```
+
+By default this writes configs for the common MGS4 title IDs (`BLUS30109`, `BLES00246`, `NPUB31633`, `NPEB02134`) and enables:
+- `Vulkan`
+- `Async Shader Recompiler`
+- `Multithreaded RSX`
+- `Asynchronous Texture Streaming 2`
+- `Use Re-BAR for GPU uploads`
+- `RPCS3 Scheduler`
+
+If you want extra profiling data while benchmarking, add `-EnablePerfReport` and optionally `-EnablePerfOverlay`.
+
+#### Logged run helper
+
+To make sure each benchmark run leaves behind a self-contained artifact bundle, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Run-RPCS3-Logged.ps1 -TitleId NPUB31633
+```
+
+This wrapper:
+- launches `rpcs3.exe` with `--stdout` and `--stderr`
+- auto-selects `.\bin\config\custom_configs\config_<TITLE_ID>.yml` when present
+- archives console output, config snapshots, and any RPCS3 log artifacts into `.\bin\run_logs\<timestamp>-<TITLE_ID>\`
+
+For a windowless benchmark run, add `-NoGui`.
+
+#### Lightweight benchmark workflow
+
+For repeatable local before/after comparisons that you can paste into an upstream PR:
+
+1. Generate the MGS4 profile with performance reporting enabled:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Set-MGS4-Profile.ps1 -EnablePerfReport
+   ```
+
+2. Launch one labeled benchmark run into a session folder:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Start-MGS4-Benchmark.ps1 -SessionName am5-affinity -Variant baseline -Scene "act1-combat"
+   ```
+
+3. Repeat with the comparison build or config, changing only `-Variant`:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Start-MGS4-Benchmark.ps1 -SessionName am5-affinity -Variant candidate -Scene "act1-combat"
+   ```
+
+4. Summarize the collected runs into a markdown report:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Summarize-MGS4-Benchmark.ps1 -SessionName am5-affinity
+   ```
+
+The summary is written to `.\bin\benchmarks\<session>\summary.md` and extracts:
+- run duration
+- shader compiler worker selection and timing summaries
+- Vulkan queue diagnostics
+- guest crash detection
+
+Notes:
+- `MSBuild` is the closest match to the upstream Windows CI workflow.
+- `CMake` uses the repository's `msvc` preset and writes output to `build-msvc\bin`.
+- If your checkout is a source snapshot rather than a git clone, `-SyncSubmodules` is skipped automatically.
+
 #### Building with Visual Studio sln solution
 
 Start **Visual Studio**, click on `Open a project or solution` and select the `rpcs3.sln` file inside the RPCS3's root folder
@@ -191,3 +283,52 @@ If compiling for ARM, pass the flag `-DUSE_NATIVE_INSTRUCTIONS=OFF` to the first
 
 When using GDB, configure it to ignore SIGSEGV signal (`handle SIGSEGV nostop noprint`).
 If desired, use the various build options in [CMakeLists](https://github.com/RPCS3/rpcs3/blob/master/CMakeLists.txt).
+
+### Local Performance Tooling
+
+This local tree also includes a simple Windows tooling launcher for performance and crash work:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Start-RPCS3-Tooling.ps1 -LaunchRpcs3
+```
+
+That will:
+- start `PresentMon` capture for `rpcs3.exe`
+- start `ProcDump` monitoring for unhandled exceptions and hung-window dumps
+- create a timestamped folder under `bin\tool_runs`
+- optionally launch `bin\rpcs3.exe`
+
+Useful outputs:
+- PresentMon CSV: `bin\tool_runs\<timestamp>\presentmon\presentmon.csv`
+- ProcDump captures: `bin\tool_runs\<timestamp>\dumps`
+- Session summary: `bin\tool_runs\<timestamp>\session.txt`
+
+Desktop launcher:
+- `C:\Users\jflow\Desktop\Launch-RPCS3-Tooling.cmd`
+- `C:\Users\jflow\Desktop\Stop-RPCS3-Tooling.cmd`
+
+### Local Upstream Audit
+
+To check whether local Vulkan/RSX/PPU/Utilities work has diverged from upstream in important areas:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Audit-Upstream-RPCS3.ps1 -Fetch
+```
+
+This reports:
+- current local `HEAD` and `upstream/master`
+- ahead/behind counts
+- the local and upstream `VulkanMemoryAllocator` submodule pointers
+- local modifications in watched paths
+- upstream file deltas and recent upstream commits in watched paths
+
+Desktop launcher:
+- `C:\Users\jflow\Desktop\Audit-RPCS3-Upstream.cmd`
+
+### Clean Control Tree
+
+A clean upstream control worktree is available at:
+- `C:\Projects\RPCS3-upstream-clean`
+
+That worktree tracks `upstream/master` and includes a local `Build-RPCS3.ps1` wrapper that reuses the shared build helper from:
+- `C:\Projects\RPCS3-buildable\Build-RPCS3.ps1`

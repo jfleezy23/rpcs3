@@ -2976,7 +2976,6 @@ u64 thread_ctrl::get_affinity_mask(thread_class group)
 			u64 spu_mask, ppu_mask, rsx_mask;
 			spu_mask = ppu_mask = rsx_mask = all_cores_mask; // Fallback, in case someone is messing with core config
 
-			const auto system_id = utils::get_cpu_brand();
 			const auto family_id = utils::get_cpu_family();
 			const auto model_id = utils::get_cpu_model();
 
@@ -3079,10 +3078,10 @@ u64 thread_ctrl::get_affinity_mask(thread_class group)
 				break;
 			}
 			case 0x19: // Zen3
+			case 0x1A: // Zen4 / Zen5
 			{
-				// Single-CCX architecture, just disable SMT if wide enough
-				// CCX now holds upto 16 threads
-				// Lack of hw availability makes testing difficult
+				// Zen3+ desktop parts benefit from the same wide-CPU SMT thinning heuristic:
+				// prefer spreading heavy emulation threads across physical cores first.
 				switch (thread_count)
 				{
 				case 24:

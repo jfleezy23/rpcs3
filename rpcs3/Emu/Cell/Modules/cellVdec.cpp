@@ -8,6 +8,7 @@
 #include "Emu/savestate_utils.hpp"
 #include "sysPrxForUser.h"
 #include "util/media_utils.h"
+#include "util/sysinfo.hpp"
 
 #ifdef _MSC_VER
 #pragma warning(push, 0)
@@ -32,6 +33,7 @@ extern "C"
 #include "cellPamf.h"
 #include "cellVdec.h"
 
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <cmath>
@@ -42,6 +44,83 @@ extern "C"
 std::mutex g_mutex_avcodec_open2;
 
 LOG_CHANNEL(cellVdec);
+
+namespace
+{
+	bool is_interlaced_frame(const AVFrame* frame)
+	{
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
+		return frame && frame->interlaced_frame != 0;
+#else
+		return frame && !!(frame->flags & AV_FRAME_FLAG_INTERLACED);
+#endif
+	}
+
+	bool is_top_field_first_frame(const AVFrame* frame)
+	{
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
+		return frame && frame->top_field_first != 0;
+#else
+		return frame && !!(frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
+#endif
+	}
+
+	void deinterlace_plane_in_place(u8* data, int pitch, int width_bytes, int height, int preserved_parity)
+	{
+		if (!data || pitch <= 0 || width_bytes <= 0 || height <= 1)
+		{
+			return;
+		}
+
+		for (int y = 0; y < height; y++)
+		{
+			if ((y & 1) == preserved_parity)
+			{
+				continue;
+			}
+
+			u8* const dst = data + y * pitch;
+			const int prev_y = y > 0 ? y - 1 : y + 1;
+			const int next_y = y + 1 < height ? y + 1 : y - 1;
+			const u8* const prev = data + prev_y * pitch;
+			const u8* const next = data + next_y * pitch;
+
+			if (prev_y == next_y)
+			{
+				std::memcpy(dst, prev, width_bytes);
+				continue;
+			}
+
+			for (int x = 0; x < width_bytes; x++)
+			{
+				dst[x] = static_cast<u8>((static_cast<u16>(prev[x]) + static_cast<u16>(next[x]) + 1) / 2);
+			}
+		}
+	}
+
+	void deinterlace_output_frame(CellVdecPicFormatType format_type, u8* const out_data[4], const int out_line[4], int width, int height, bool top_field_first)
+	{
+		const int preserved_parity = top_field_first ? 0 : 1;
+
+		switch (format_type)
+		{
+		case CELL_VDEC_PICFMT_ARGB32_ILV:
+		case CELL_VDEC_PICFMT_RGBA32_ILV:
+			deinterlace_plane_in_place(out_data[0], out_line[0], width * 4, height, preserved_parity);
+			break;
+		case CELL_VDEC_PICFMT_UYVY422_ILV:
+			deinterlace_plane_in_place(out_data[0], out_line[0], width * 2, height, preserved_parity);
+			break;
+		case CELL_VDEC_PICFMT_YUV420_PLANAR:
+			deinterlace_plane_in_place(out_data[0], out_line[0], width, height, preserved_parity);
+			deinterlace_plane_in_place(out_data[1], out_line[1], std::max(1, width / 2), std::max(1, height / 2), preserved_parity);
+			deinterlace_plane_in_place(out_data[2], out_line[2], std::max(1, width / 2), std::max(1, height / 2), preserved_parity);
+			break;
+		default:
+			break;
+		}
+	}
+}
 
 template<>
 void fmt_class_string<CellVdecError>::format(std::string& out, u64 arg)
@@ -265,6 +344,10 @@ struct vdec_context final
 
 		AVDictionary* opts = nullptr;
 
+		// Give prerendered cutscene decode some parallel headroom on modern CPUs.
+		ctx->thread_count = std::clamp<u32>(utils::get_thread_count() / 4, 2, 8);
+		ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
 		std::lock_guard lock(g_mutex_avcodec_open2);
 
 		int err = avcodec_open2(ctx, codec, &opts);
@@ -449,22 +532,22 @@ struct vdec_context final
 							fmt::throw_exception("AU decoding error (handle=0x%x, seq_id=%d, cmd_id=%d, error=0x%x): %s", handle, cmd->seq_id, cmd->id, ret, utils::av_error_to_string(ret));
 						}
 
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(60, 31, 102)
+	#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(60, 31, 102)
 						const int ticks_per_frame = ctx->ticks_per_frame;
-#else
+	#else
 						const int ticks_per_frame = (codec_desc->props & AV_CODEC_PROP_FIELDS) ? 2 : 1;
-#endif
+	#endif
 
-#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
-						const bool is_interlaced = frame->interlaced_frame != 0;
-#else
-						const bool is_interlaced = !!(frame->flags & AV_FRAME_FLAG_INTERLACED);
-#endif
+						const bool is_interlaced = is_interlaced_frame(frame.avf.get());
 
 						if (is_interlaced)
 						{
-							// NPEB01838, NPUB31260
-							cellVdec.todo("Interlaced frames not supported (handle=0x%x, seq_id=%d, cmd_id=%d)", handle, cmd->seq_id, cmd->id);
+							static std::atomic<bool> s_reported_interlaced_support = false;
+
+							if (!s_reported_interlaced_support.exchange(true))
+							{
+								cellVdec.notice("Interlaced video detected. Using field-aware MPEG-2 output path.");
+							}
 						}
 
 						if (frame->repeat_pict)
@@ -1383,7 +1466,10 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 
 		cellVdec.trace("cellVdecGetPictureExt: handle=0x%x, seq_id=%d, cmd_id=%d, w=%d, h=%d, frameFormat=%d, formatType=%d, in_f=%d, out_f=%d, alpha_plane=%d, alpha=%d, colorMatrixType=%d", handle, frame.seq_id, frame.cmd_id, w, h, frame->format, format->formatType, +in_f, +out_f, !!alpha_plane, format->alpha, format->colorMatrixType);
 
-		vdec->sws = sws_getCachedContext(vdec->sws, w, h, in_f, w, h, out_f, SWS_POINT, nullptr, nullptr, nullptr);
+		// MPEG-2 FMVs are often interlaced and chroma-starved; a slightly smoother conversion filter
+		// helps the final output without changing decode cadence or game timing.
+		const int sws_flags = vdec->type == CELL_VDEC_CODEC_TYPE_MPEG2 ? SWS_BILINEAR : SWS_POINT;
+		vdec->sws = sws_getCachedContext(vdec->sws, w, h, in_f, w, h, out_f, sws_flags, nullptr, nullptr, nullptr);
 
 		u8* in_data[4] = { frame->data[0], frame->data[1], frame->data[2], alpha_plane.get() };
 		int in_line[4] = { frame->linesize[0], frame->linesize[1], frame->linesize[2], w * 1 };
@@ -1407,6 +1493,12 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 		}
 
 		sws_scale(vdec->sws, in_data, in_line, 0, h, out_data, out_line);
+
+		if (vdec->type == CELL_VDEC_CODEC_TYPE_MPEG2 && is_interlaced_frame(frame.avf.get()))
+		{
+			const auto format_type = static_cast<CellVdecPicFormatType>(+format->formatType);
+			deinterlace_output_frame(format_type, out_data, out_line, w, h, is_top_field_first_frame(frame.avf.get()));
+		}
 	}
 
 	return CELL_OK;
@@ -1640,6 +1732,8 @@ error_code cellVdecGetPicItem(ppu_thread& ppu, u32 handle, vm::pptr<CellVdecPicI
 	else if (vdec->type == CELL_VDEC_CODEC_TYPE_MPEG2)
 	{
 		const vm::ptr<CellVdecMpeg2Info> mp2 = picinfo_addr;
+		const bool is_interlaced = is_interlaced_frame(frame);
+		const bool top_field_first = is_top_field_first_frame(frame);
 
 		std::memset(mp2.get_ptr(), 0, sizeof(CellVdecMpeg2Info));
 		mp2->horizontal_size = frame->width;
@@ -1659,7 +1753,7 @@ error_code cellVdecGetPicItem(ppu_thread& ppu, u32 handle, vm::pptr<CellVdecPicI
 		default: cellVdec.error("cellVdecGetPicItem(MPEG2): unknown frc value (handle=0x%x, seq_id=%d, cmd_id=%d, frc=0x%x)", handle, seq_id, cmd_id, frc);
 		}
 
-		mp2->progressive_sequence = true; // ???
+		mp2->progressive_sequence = !is_interlaced;
 		mp2->low_delay = true; // ???
 		mp2->video_format = CELL_VDEC_MPEG2_VF_UNSPECIFIED; // ???
 		mp2->colour_description = false; // ???
@@ -1673,8 +1767,11 @@ error_code cellVdecGetPicItem(ppu_thread& ppu, u32 handle, vm::pptr<CellVdecPicI
 		}
 
 		mp2->picture_coding_type[1] = CELL_VDEC_MPEG2_PCT_FORBIDDEN; // ???
-		mp2->picture_structure[0] = CELL_VDEC_MPEG2_PSTR_FRAME;
-		mp2->picture_structure[1] = CELL_VDEC_MPEG2_PSTR_FRAME;
+		mp2->picture_structure[0] = is_interlaced ? (top_field_first ? CELL_VDEC_MPEG2_PSTR_TOP_FIELD : CELL_VDEC_MPEG2_PSTR_BOTTOM_FIELD) : CELL_VDEC_MPEG2_PSTR_FRAME;
+		mp2->picture_structure[1] = is_interlaced ? (top_field_first ? CELL_VDEC_MPEG2_PSTR_BOTTOM_FIELD : CELL_VDEC_MPEG2_PSTR_TOP_FIELD) : CELL_VDEC_MPEG2_PSTR_FRAME;
+		mp2->top_field_first = top_field_first;
+		mp2->repeat_first_field = false;
+		mp2->progressive_frame = !is_interlaced;
 
 		// ...
 	}

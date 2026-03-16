@@ -3923,10 +3923,12 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 	g_progr_ftotal += ::size32(file_queue);
 
 	u64 total_files_size = 0;
+	u64 largest_file_size = 0;
 
 	for (const file_info& info : file_queue)
 	{
 		total_files_size += info.file_size;
+		largest_file_size = std::max<u64>(largest_file_size, info.file_size);
 	}
 
 	g_progr_ftotal_bits += total_files_size;
@@ -3943,10 +3945,16 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 	// The growth in memory requirements of LLVM is not linear with file size of course
 	// But these estimates should hopefully protect RPCS3 in the coming years
 	// Especially when thread count is on the rise with each CPU generation
-	atomic_t<u32> file_size_limit = static_cast<u32>(std::clamp<u64>(utils::aligned_div<u64>(utils::get_total_memory(), 2000), 65536, u32{umax}));
+	const u32 initial_file_size_limit = static_cast<u32>(std::clamp<u64>(utils::aligned_div<u64>(utils::get_total_memory(), 2000), 65536, u32{umax}));
+	atomic_t<u32> file_size_limit = initial_file_size_limit;
 
 	const u32 software_thread_limit = std::min<u32>(g_cfg.core.llvm_threads ? g_cfg.core.llvm_threads : u32{umax}, ::size32(file_queue));
 	const u32 cpu_thread_limit = utils::get_thread_count() > 8u ? std::max<u32>(utils::get_thread_count(), 2) - 1 : utils::get_thread_count(); // One LLVM thread less
+	const u32 precompile_worker_count = std::min<u32>(software_thread_limit, cpu_thread_limit);
+
+	atomic_t<u32> memory_wait_events = 0;
+	atomic_t<u64> memory_wait_total_us = 0;
+	atomic_t<u64> memory_wait_longest_us = 0;
 
 	std::vector<u128> decrypt_klics;
 
@@ -3994,7 +4002,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 		}
 	}
 
-	named_thread_group workers("SPRX Worker ", std::min<u32>(software_thread_limit, cpu_thread_limit), [&]
+	named_thread_group workers("SPRX Worker ", precompile_worker_count, [&]
 	{
 #ifdef __APPLE__
 		pthread_jit_write_protect_np(false);
@@ -4092,6 +4100,9 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 			{
 				// Try not to process too many files at once because it seems to reduce performance and cause RAM shortages
 				// Concurrently compiling more OVL or huge PRX files does not have much theoretical benefit
+				const u64 wait_start = get_system_time();
+				bool waited_for_memory = false;
+
 				while (!file_size_limit.fetch_op([&](u32& value)
 				{
 					if (value)
@@ -4108,8 +4119,27 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 					return false;
 				}).second)
 				{
+					waited_for_memory = true;
+
 					// Wait until not 0
 					file_size_limit.wait(0);
+				}
+
+				if (waited_for_memory)
+				{
+					const u64 waited_us = get_system_time() - wait_start;
+					memory_wait_events++;
+					memory_wait_total_us += waited_us;
+					memory_wait_longest_us.fetch_op([&](u64& value)
+					{
+						if (waited_us > value)
+						{
+							value = waited_us;
+							return true;
+						}
+
+						return false;
+					});
 				}
 
 				if (Emu.IsStopped())
@@ -4216,6 +4246,19 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 
 	// Join every thread
 	workers.join();
+
+	if (const u32 wait_events = memory_wait_events.load())
+	{
+		ppu_log.notice("PPU precompile memory gate: workers=%u, budget=%u MiB, files=%u, queued=%u MiB, largest=%u KiB, waits=%u, total_wait=%.3fs, max_wait=%.3fs",
+			precompile_worker_count,
+			utils::aligned_div<u32>(initial_file_size_limit, 1u << 20),
+			::size32(file_queue),
+			utils::aligned_div<u64>(total_files_size, 1u << 20),
+			utils::aligned_div<u64>(largest_file_size, 1u << 10),
+			wait_events,
+			memory_wait_total_us.load() / 1000000.,
+			memory_wait_longest_us.load() / 1000000.);
+	}
 
 	named_thread exec_worker("PPU Exec Worker", [&]
 	{

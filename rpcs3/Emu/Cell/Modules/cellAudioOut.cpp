@@ -471,7 +471,7 @@ error_code cellAudioOutGetConfiguration(u32 audioOut, vm::ptr<CellAudioOutConfig
 
 error_code cellAudioOutGetNumberOfDevice(u32 audioOut)
 {
-	cellSysutil.warning("cellAudioOutGetNumberOfDevice(audioOut=%d)", audioOut);
+	cellSysutil.trace("cellAudioOutGetNumberOfDevice(audioOut=%d)", audioOut);
 
 	switch (audioOut)
 	{

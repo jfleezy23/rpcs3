@@ -9,12 +9,19 @@
 #include "Emu/system_config.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 
 namespace rsx
 {
 	namespace fragment_program
 	{
 		using namespace rsx::assembler;
+
+		namespace
+		{
+			std::array<std::atomic_bool, 4> g_logged_rop_gather_outputs{};
+		}
 
 		static const std::string reg_table[] =
 		{
@@ -833,7 +840,9 @@ std::string FragmentProgramDecompiler::BuildCode()
 	for (u32 n = 0; n < 4; ++n)
 	{
 		const auto& reg_name = output_register_names[n];
-		if (!m_parr.HasParam(PF_PARAM_NONE, float4_type, reg_name))
+		const bool had_static_output = m_parr.HasParam(PF_PARAM_NONE, float4_type, reg_name);
+
+		if (!had_static_output)
 		{
 			m_parr.AddParam(PF_PARAM_NONE, float4_type, reg_name, init_value);
 		}
@@ -844,8 +853,10 @@ std::string FragmentProgramDecompiler::BuildCode()
 			continue;
 		}
 
-		// Emit debug warning. Useful to diagnose regressions, but should be removed in future.
-		rsx_log.warning("ROP reads from %s without writing to it. Final value will be gathered.", reg_name);
+		if (!had_static_output && !g_logged_rop_gather_outputs[n].exchange(true, std::memory_order_relaxed))
+		{
+			rsx_log.warning("ROP synthesized %s from the gathered output path (further occurrences suppressed).", reg_name);
+		}
 	}
 
 	if (properties.has_dynamic_register_load)
