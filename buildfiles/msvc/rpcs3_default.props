@@ -31,6 +31,7 @@
         Bcrypt.lib;
         avcodec.lib;
         avformat.lib;
+        avfilter.lib;
         avutil.lib;
         swresample.lib;
         swscale.lib;

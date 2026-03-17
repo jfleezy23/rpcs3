@@ -21,7 +21,11 @@
 extern "C"
 {
 #include "libavcodec/avcodec.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersink.h"
+#include "libavfilter/buffersrc.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/opt.h"
 #include "libswscale/swscale.h"
 }
 #ifdef _MSC_VER
@@ -34,6 +38,7 @@ extern "C"
 #include "cellVdec.h"
 
 #include <atomic>
+#include <string>
 #include <mutex>
 #include <queue>
 #include <cmath>
@@ -64,6 +69,96 @@ namespace
 		return frame && !!(frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
 #endif
 	}
+
+	void mark_progressive_frame(AVFrame* frame)
+	{
+		if (!frame)
+		{
+			return;
+		}
+
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
+		frame->interlaced_frame = 0;
+		frame->top_field_first = 0;
+#else
+		frame->flags &= ~AV_FRAME_FLAG_INTERLACED;
+		frame->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
+#endif
+	}
+
+	AVRational framerate_code_to_rational(u32 frc)
+	{
+		switch (frc)
+		{
+		case CELL_VDEC_FRC_24000DIV1001: return { 24000, 1001 };
+		case CELL_VDEC_FRC_24: return { 24, 1 };
+		case CELL_VDEC_FRC_25: return { 25, 1 };
+		case CELL_VDEC_FRC_30000DIV1001: return { 30000, 1001 };
+		case CELL_VDEC_FRC_30: return { 30, 1 };
+		case CELL_VDEC_FRC_50: return { 50, 1 };
+		case CELL_VDEC_FRC_60000DIV1001: return { 60000, 1001 };
+		case CELL_VDEC_FRC_60: return { 60, 1 };
+		default: return { 0, 1 };
+		}
+	}
+
+	u32 doubled_framerate_code(u32 frc)
+	{
+		switch (frc)
+		{
+		case CELL_VDEC_FRC_25: return CELL_VDEC_FRC_50;
+		case CELL_VDEC_FRC_30000DIV1001: return CELL_VDEC_FRC_60000DIV1001;
+		case CELL_VDEC_FRC_30: return CELL_VDEC_FRC_60;
+		default: return 0;
+		}
+	}
+
+	bool should_use_host_mpeg2_filter(u32 codec_type, const AVFrame* frame, u32 frc)
+	{
+		return codec_type == CELL_VDEC_CODEC_TYPE_MPEG2 && is_interlaced_frame(frame) && doubled_framerate_code(frc) != 0;
+	}
+
+	struct host_filter_state
+	{
+		AVFilterGraph* graph{};
+		AVFilterContext* src{};
+		AVFilterContext* sink{};
+		AVRational input_time_base{};
+		AVRational output_time_base{};
+		u32 output_frc{};
+		s64 next_input_pts{};
+		u64 pts_origin{};
+		std::string active_filter_name;
+		u64 queued_inputs{};
+		u64 emitted_outputs{};
+		u64 last_seq_id{};
+		u64 last_cmd_id{};
+		u64 last_userdata{};
+		CellVdecPicAttr last_attr = CELL_VDEC_PICITEM_ATTR_NORMAL;
+		bool warned_no_output{};
+		bool failed{};
+
+		void reset()
+		{
+			avfilter_graph_free(&graph);
+			src = nullptr;
+			sink = nullptr;
+			input_time_base = {};
+			output_time_base = {};
+			output_frc = 0;
+			next_input_pts = 0;
+			pts_origin = 0;
+			active_filter_name.clear();
+			queued_inputs = 0;
+			emitted_outputs = 0;
+			last_seq_id = 0;
+			last_cmd_id = 0;
+			last_userdata = 0;
+			last_attr = CELL_VDEC_PICITEM_ATTR_NORMAL;
+			warned_no_output = false;
+			failed = false;
+		}
+	};
 
 	void deinterlace_plane_in_place(u8* data, int pitch, int width_bytes, int height, int preserved_parity)
 	{
@@ -248,8 +343,8 @@ struct vdec_frame
 	}
 };
 
-struct vdec_context final
-{
+	struct vdec_context final
+	{
 	static const u32 id_base = 0xf0000000;
 	static const u32 id_step = 0x00000100;
 	static const u32 id_count = 1024;
@@ -267,6 +362,7 @@ struct vdec_context final
 	const AVCodecDescriptor* codec_desc{};
 	AVCodecContext* ctx{};
 	SwsContext* sws{};
+	host_filter_state mpeg2_filter{};
 
 	shared_mutex mutex; // Used for 'out' queue (TODO)
 
@@ -284,6 +380,19 @@ struct vdec_context final
 
 	std::deque<vdec_frame> out_queue;
 	const u32 out_max = 60;
+
+	u32 get_output_queue_limit() const
+	{
+		// Host-enhanced MPEG-2 can legitimately emit twice as many pictures as the
+		// original stream, so give it more buffering room to avoid pacing the decoder
+		// against the consumer too aggressively.
+		if (type == CELL_VDEC_CODEC_TYPE_MPEG2 && mpeg2_filter.graph && mpeg2_filter.output_frc >= CELL_VDEC_FRC_50)
+		{
+			return out_max * 4;
+		}
+
+		return out_max;
+	}
 
 	atomic_t<s32> au_count{0};
 
@@ -344,9 +453,15 @@ struct vdec_context final
 
 		AVDictionary* opts = nullptr;
 
-		// Give prerendered cutscene decode some parallel headroom on modern CPUs.
-		ctx->thread_count = std::clamp<u32>(utils::get_thread_count() / 4, 2, 8);
-		ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+		// Give prerendered cutscene decode more headroom on wide CPUs, but keep the
+		// MPEG-2 path low-latency by preferring slice threading over deeper frame
+		// queues. Other codecs stay on the older mixed frame/slice budget.
+		ctx->thread_count = type == CELL_VDEC_CODEC_TYPE_MPEG2
+			? std::clamp<u32>((utils::get_thread_count() * 2) / 3, 8, 20)
+			: std::clamp<u32>(utils::get_thread_count() / 4, 2, 8);
+		ctx->thread_type = type == CELL_VDEC_CODEC_TYPE_MPEG2
+			? FF_THREAD_SLICE
+			: FF_THREAD_FRAME | FF_THREAD_SLICE;
 
 		std::lock_guard lock(g_mutex_avcodec_open2);
 
@@ -373,6 +488,7 @@ struct vdec_context final
 
 	~vdec_context()
 	{
+		mpeg2_filter.reset();
 		avcodec_free_context(&ctx);
 		sws_freeContext(sws);
 	}
@@ -388,6 +504,332 @@ struct vdec_context final
 		if (std::abs(freq - 59.940) < 0.002) return CELL_VDEC_FRC_60000DIV1001;
 		if (std::abs(freq - 60.000) < 0.001) return CELL_VDEC_FRC_60;
 		return 0;
+	}
+
+	bool init_mpeg2_filter(const AVFrame* frame, u32 input_frc, u64 pts_origin)
+	{
+		mpeg2_filter.reset();
+
+		if (!should_use_host_mpeg2_filter(type, frame, input_frc))
+		{
+			return false;
+		}
+
+		const AVRational input_fps = framerate_code_to_rational(input_frc);
+
+		if (!input_fps.num || !input_fps.den)
+		{
+			return false;
+		}
+
+		const AVRational sample_aspect = frame->sample_aspect_ratio.num && frame->sample_aspect_ratio.den ? frame->sample_aspect_ratio : AVRational{ 1, 1 };
+		const AVFilter* const buffersrc = avfilter_get_by_name("buffer");
+		const AVFilter* const buffersink = avfilter_get_by_name("buffersink");
+
+		if (!buffersrc || !buffersink)
+		{
+			cellVdec.warning("Host MPEG-2 enhancement filters are unavailable. Falling back to the standard decode path.");
+			mpeg2_filter.failed = true;
+			return false;
+		}
+
+		mpeg2_filter.input_time_base = av_inv_q(input_fps);
+		mpeg2_filter.output_time_base = av_mul_q(mpeg2_filter.input_time_base, AVRational{ 1, 2 });
+		mpeg2_filter.output_frc = doubled_framerate_code(input_frc);
+		mpeg2_filter.pts_origin = pts_origin;
+
+		char args[256]{};
+		std::snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+			frame->width, frame->height, frame->format,
+			mpeg2_filter.input_time_base.num, mpeg2_filter.input_time_base.den,
+			sample_aspect.num, sample_aspect.den);
+
+		const AVPixelFormat pix_fmts[] = { static_cast<AVPixelFormat>(frame->format), AV_PIX_FMT_NONE };
+		const bool has_libplacebo = avfilter_get_by_name("libplacebo") != nullptr;
+		const bool has_bwdif = avfilter_get_by_name("bwdif") != nullptr;
+		const bool has_yadif = avfilter_get_by_name("yadif") != nullptr;
+		const AVRational output_fps = framerate_code_to_rational(mpeg2_filter.output_frc);
+		char fps_arg[32]{};
+		std::snprintf(fps_arg, sizeof(fps_arg), "%d/%d", output_fps.num, output_fps.den);
+
+		const auto try_filter = [&](const char* filter_name, const std::string& filter_desc) -> bool
+		{
+			mpeg2_filter.graph = avfilter_graph_alloc();
+
+			if (!mpeg2_filter.graph)
+			{
+				cellVdec.warning("Failed to allocate the host MPEG-2 enhancement graph. Falling back to the standard decode path.");
+				return false;
+			}
+
+			if (const int ret = avfilter_graph_create_filter(&mpeg2_filter.src, buffersrc, "mgs4_mpeg2_src", args, nullptr, mpeg2_filter.graph); ret < 0)
+			{
+				cellVdec.warning("Failed to create the host MPEG-2 source filter for '%s' (error=0x%x): %s", filter_name, ret, utils::av_error_to_string(ret));
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			if (const int ret = avfilter_graph_create_filter(&mpeg2_filter.sink, buffersink, "mgs4_mpeg2_sink", nullptr, nullptr, mpeg2_filter.graph); ret < 0)
+			{
+				cellVdec.warning("Failed to create the host MPEG-2 sink filter for '%s' (error=0x%x): %s", filter_name, ret, utils::av_error_to_string(ret));
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			if (const int ret = av_opt_set_int_list(mpeg2_filter.sink, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN); ret < 0)
+			{
+				cellVdec.warning("Failed to constrain the host MPEG-2 sink pixel format for '%s' (error=0x%x): %s", filter_name, ret, utils::av_error_to_string(ret));
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			AVFilterInOut* outputs = avfilter_inout_alloc();
+			AVFilterInOut* inputs = avfilter_inout_alloc();
+
+			if (!outputs || !inputs)
+			{
+				avfilter_inout_free(&outputs);
+				avfilter_inout_free(&inputs);
+				cellVdec.warning("Failed to allocate the host MPEG-2 filter graph endpoints for '%s'. Falling back to the standard decode path.", filter_name);
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			outputs->name = av_strdup("in");
+			outputs->filter_ctx = mpeg2_filter.src;
+			outputs->pad_idx = 0;
+			outputs->next = nullptr;
+
+			inputs->name = av_strdup("out");
+			inputs->filter_ctx = mpeg2_filter.sink;
+			inputs->pad_idx = 0;
+			inputs->next = nullptr;
+
+			const int parse_ret = avfilter_graph_parse_ptr(mpeg2_filter.graph, filter_desc.c_str(), &inputs, &outputs, nullptr);
+			avfilter_inout_free(&inputs);
+			avfilter_inout_free(&outputs);
+
+			if (parse_ret < 0)
+			{
+				cellVdec.notice("Host MPEG-2 enhancement variant '%s' was rejected (error=0x%x): %s", filter_name, parse_ret, utils::av_error_to_string(parse_ret));
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			if (const int ret = avfilter_graph_config(mpeg2_filter.graph, nullptr); ret < 0)
+			{
+				cellVdec.notice("Host MPEG-2 enhancement variant '%s' could not be configured (error=0x%x): %s", filter_name, ret, utils::av_error_to_string(ret));
+				mpeg2_filter.reset();
+				return false;
+			}
+
+			if (const AVRational sink_time_base = av_buffersink_get_time_base(mpeg2_filter.sink); sink_time_base.num && sink_time_base.den)
+			{
+				mpeg2_filter.output_time_base = sink_time_base;
+			}
+
+			if (const AVRational sink_frame_rate = av_buffersink_get_frame_rate(mpeg2_filter.sink); sink_frame_rate.num && sink_frame_rate.den)
+			{
+				if (const u32 sink_frc = freq_to_framerate_code(av_q2d(sink_frame_rate)); sink_frc)
+				{
+					mpeg2_filter.output_frc = sink_frc;
+				}
+			}
+
+			mpeg2_filter.active_filter_name = filter_name;
+			cellVdec.notice("Host MPEG-2 enhancement path enabled with '%s' at %d/%d fps (time_base=%d/%d).", filter_name, output_fps.num, output_fps.den, mpeg2_filter.output_time_base.num, mpeg2_filter.output_time_base.den);
+			return true;
+		};
+
+		if (has_libplacebo)
+		{
+			std::string filter_desc = "libplacebo=deinterlace=bob";
+			filter_desc += ":send_fields=1";
+
+			if (try_filter("libplacebo-bob-fast", filter_desc))
+			{
+				return true;
+			}
+
+			filter_desc = "libplacebo=deinterlace=yadif";
+			filter_desc += ":skip_spatial_check=1";
+			filter_desc += ":send_fields=1";
+
+			if (try_filter("libplacebo-yadif-fast", filter_desc))
+			{
+				return true;
+			}
+		}
+
+		if ((has_bwdif || has_yadif) && has_libplacebo)
+		{
+			std::string filter_desc = has_bwdif
+				? "bwdif=mode=send_field:parity=auto:deint=interlaced,libplacebo=fps="
+				: "yadif=mode=send_field:parity=auto:deint=interlaced,libplacebo=fps=";
+			filter_desc += fps_arg;
+			filter_desc += ":frame_mixer=mitchell_clamp";
+			filter_desc += ":upscaler=ewa_lanczos";
+			filter_desc += ":downscaler=ewa_lanczos";
+			filter_desc += ":deband=1";
+			filter_desc += ":deband_iterations=3";
+			filter_desc += ":deband_radius=8";
+			filter_desc += ":deband_threshold=6";
+			filter_desc += ":deband_grain=4";
+
+			if (try_filter(has_bwdif ? "bwdif+libplacebo-hq" : "yadif+libplacebo-hq", filter_desc))
+			{
+				return true;
+			}
+		}
+
+		if (has_bwdif && try_filter("bwdif", "bwdif=mode=send_field:parity=auto:deint=interlaced"))
+		{
+			return true;
+		}
+
+		if (has_yadif && try_filter("yadif", "yadif=mode=send_field:parity=auto:deint=interlaced"))
+		{
+			return true;
+		}
+
+		cellVdec.warning("Host MPEG-2 enhancement filters are unavailable. libplacebo/bwdif/yadif variants all failed or were missing in this FFmpeg build.");
+		mpeg2_filter.reset();
+		mpeg2_filter.failed = true;
+		return false;
+	}
+
+	bool drain_filtered_mpeg2_frames(std::deque<vdec_frame>& decoded_frames)
+	{
+		bool emitted_frame = false;
+
+		while (true)
+		{
+			vdec_frame filtered_frame;
+			filtered_frame.seq_id = mpeg2_filter.last_seq_id;
+			filtered_frame.cmd_id = mpeg2_filter.last_cmd_id;
+			filtered_frame.userdata = mpeg2_filter.last_userdata;
+			filtered_frame.attr = mpeg2_filter.last_attr;
+			filtered_frame.frc = mpeg2_filter.output_frc;
+			filtered_frame.avf.reset(av_frame_alloc());
+
+			if (!filtered_frame.avf)
+			{
+				cellVdec.warning("Failed to allocate an MPEG-2 output frame for the host enhancement path.");
+				mpeg2_filter.reset();
+				mpeg2_filter.failed = true;
+				return false;
+			}
+
+			const int ret = av_buffersink_get_frame(mpeg2_filter.sink, filtered_frame.avf.get());
+
+			if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+			{
+				break;
+			}
+
+			if (ret < 0)
+			{
+				cellVdec.warning("Failed to drain an MPEG-2 frame from the host enhancement graph (error=0x%x): %s", ret, utils::av_error_to_string(ret));
+				mpeg2_filter.reset();
+				mpeg2_filter.failed = true;
+				return false;
+			}
+
+			mark_progressive_frame(filtered_frame.avf.get());
+
+			const s64 filtered_pts = filtered_frame->pts != AV_NOPTS_VALUE ? filtered_frame->pts : 0;
+			const u64 pts_90k = mpeg2_filter.pts_origin + av_rescale_q(filtered_pts, mpeg2_filter.output_time_base, AVRational{ 1, 90000 });
+
+			filtered_frame.pts = pts_90k;
+			filtered_frame.dts = pts_90k;
+
+			mpeg2_filter.emitted_outputs++;
+			cellVdec.trace("Got host-filtered MPEG-2 picture (handle=0x%x, seq_id=%d, cmd_id=%d, pts=0x%llx, filter_pts=%lld)", handle, filtered_frame.seq_id, filtered_frame.cmd_id, filtered_frame.pts, filtered_pts);
+			decoded_frames.push_back(std::move(filtered_frame));
+			emitted_frame = true;
+		}
+
+		return emitted_frame;
+	}
+
+	bool flush_filtered_mpeg2_frames(std::deque<vdec_frame>& decoded_frames)
+	{
+		if (!mpeg2_filter.graph || !mpeg2_filter.src || !mpeg2_filter.sink)
+		{
+			return false;
+		}
+
+		const int ret = av_buffersrc_add_frame_flags(mpeg2_filter.src, nullptr, 0);
+
+		if (ret < 0 && ret != AVERROR_EOF)
+		{
+			cellVdec.warning("Failed to flush the host MPEG-2 enhancement graph (error=0x%x): %s", ret, utils::av_error_to_string(ret));
+			mpeg2_filter.reset();
+			mpeg2_filter.failed = true;
+			return false;
+		}
+
+		return drain_filtered_mpeg2_frames(decoded_frames);
+	}
+
+	bool enqueue_filtered_mpeg2_frames(std::deque<vdec_frame>& decoded_frames, const vdec_frame& source_frame)
+	{
+		if (mpeg2_filter.failed)
+		{
+			return false;
+		}
+
+		if (!mpeg2_filter.graph && !init_mpeg2_filter(source_frame.avf.get(), source_frame.frc, source_frame.pts))
+		{
+			return false;
+		}
+
+		if (!mpeg2_filter.graph)
+		{
+			return false;
+		}
+
+		mpeg2_filter.last_seq_id = source_frame.seq_id;
+		mpeg2_filter.last_cmd_id = source_frame.cmd_id;
+		mpeg2_filter.last_userdata = source_frame.userdata;
+		mpeg2_filter.last_attr = source_frame.attr;
+
+		AVFrame* filter_input = av_frame_clone(source_frame.avf.get());
+
+		if (!filter_input)
+		{
+			cellVdec.warning("Failed to clone an MPEG-2 frame for the host enhancement path. Falling back to the standard decode path.");
+			mpeg2_filter.reset();
+			mpeg2_filter.failed = true;
+			return false;
+		}
+
+		filter_input->pts = mpeg2_filter.next_input_pts++;
+		// The newer libplacebo send_fields path derives the second field timestamp from
+		// AVFrame::duration, so make sure short MPEG-2 clips don't enter the graph with
+		// a zero-duration frame and collapse both fields onto the same output PTS.
+		filter_input->duration = filter_input->duration > 0 ? filter_input->duration : 1;
+		mpeg2_filter.queued_inputs++;
+		const int add_ret = av_buffersrc_add_frame_flags(mpeg2_filter.src, filter_input, AV_BUFFERSRC_FLAG_KEEP_REF);
+		av_frame_free(&filter_input);
+
+		if (add_ret < 0)
+		{
+			cellVdec.warning("Failed to queue an MPEG-2 frame into the host enhancement graph (error=0x%x): %s", add_ret, utils::av_error_to_string(add_ret));
+			mpeg2_filter.reset();
+			mpeg2_filter.failed = true;
+			return false;
+		}
+
+		const bool emitted_frame = drain_filtered_mpeg2_frames(decoded_frames);
+
+		if (!emitted_frame && mpeg2_filter.emitted_outputs == 0 && mpeg2_filter.queued_inputs >= 4 && !mpeg2_filter.warned_no_output)
+		{
+			cellVdec.notice("Host MPEG-2 enhancement path '%s' has queued %llu input frame(s) without producing output yet.", mpeg2_filter.active_filter_name, mpeg2_filter.queued_inputs);
+			mpeg2_filter.warned_no_output = true;
+		}
+
+		return emitted_frame;
 	}
 
 	void exec(ppu_thread& ppu, u32 vid)
@@ -440,6 +882,7 @@ struct vdec_context final
 				out_queue.clear(); // Flush image queue
 				log_time_base = {};
 				log_framerate = {};
+				mpeg2_filter.reset();
 
 				frc_set = 0; // TODO: ???
 				next_pts = 0;
@@ -452,6 +895,55 @@ struct vdec_context final
 			case vdec_cmd_type::end_sequence:
 			{
 				cellVdec.trace("End sequence... (handle=0x%x, seq_id=%d, cmd_id=%d)", handle, cmd->seq_id, cmd->id);
+
+				std::deque<vdec_frame> flushed_frames;
+				flush_filtered_mpeg2_frames(flushed_frames);
+
+				while (!flushed_frames.empty() && seq_id == cmd->seq_id)
+				{
+					u32 elapsed = 0;
+					while (thread_ctrl::state() != thread_state::aborting && !abort_decode && seq_id == cmd->seq_id)
+					{
+						{
+							std::lock_guard lock{mutex};
+
+							if (out_queue.size() <= get_output_queue_limit())
+							{
+								break;
+							}
+						}
+
+						thread_ctrl::wait_for(10000);
+
+						if (elapsed++ >= 500)
+						{
+							cellVdec.error("Video end-sequence flush has been waiting for a consumer for 5 seconds. (handle=0x%x, seq_id=%d, cmd_id=%d, queue_size=%d, queue_limit=%d)", handle, cmd->seq_id, cmd->id, out_queue.size(), get_output_queue_limit());
+							elapsed = 0;
+						}
+					}
+
+					if (thread_ctrl::state() == thread_state::aborting || abort_decode || seq_id != cmd->seq_id)
+					{
+						break;
+					}
+
+					{
+						std::lock_guard lock{mutex};
+						out_queue.push_back(std::move(flushed_frames.front()));
+						flushed_frames.pop_front();
+					}
+
+					cellVdec.trace("Sending CELL_VDEC_MSG_TYPE_PICOUT from end-sequence flush (handle=0x%x, seq_id=%d, cmd_id=%d)", handle, cmd->seq_id, cmd->id);
+					cb_func(ppu, vid, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK, cb_arg);
+					lv2_obj::sleep(ppu);
+				}
+
+				if (!mpeg2_filter.active_filter_name.empty())
+				{
+					cellVdec.notice("Host MPEG-2 enhancement summary for '%s': inputs=%llu, outputs=%llu.", mpeg2_filter.active_filter_name, mpeg2_filter.queued_inputs, mpeg2_filter.emitted_outputs);
+				}
+
+				mpeg2_filter.reset();
 
 				{
 					std::lock_guard lock{mutex};
@@ -552,7 +1044,12 @@ struct vdec_context final
 
 						if (frame->repeat_pict)
 						{
-							fmt::throw_exception("Repeated frames not supported (handle=0x%x, seq_id=%d, cmd_id=%d, repear_pict=0x%x)", handle, cmd->seq_id, cmd->id, frame->repeat_pict);
+							static std::atomic<bool> s_reported_repeat_pict = false;
+
+							if (!s_reported_repeat_pict.exchange(true))
+							{
+								cellVdec.notice("Repeated MPEG-2 picture flags detected. The host enhancement path will ignore them and continue.");
+							}
 						}
 
 						if (frame->pts != smin)
@@ -630,9 +1127,11 @@ struct vdec_context final
 						next_pts += amend;
 						next_dts += amend;
 
-						cellVdec.trace("Got picture (handle=0x%x, seq_id=%d, cmd_id=%d, pts=0x%llx[0x%llx], dts=0x%llx[0x%llx])", handle, cmd->seq_id, cmd->id, frame.pts, frame->pts, frame.dts, frame->pkt_dts);
-
-						decoded_frames.push_back(std::move(frame));
+						if (!enqueue_filtered_mpeg2_frames(decoded_frames, frame))
+						{
+							cellVdec.trace("Got picture (handle=0x%x, seq_id=%d, cmd_id=%d, pts=0x%llx[0x%llx], dts=0x%llx[0x%llx])", handle, cmd->seq_id, cmd->id, frame.pts, frame->pts, frame.dts, frame->pkt_dts);
+							decoded_frames.push_back(std::move(frame));
+						}
 					}
 				}
 
@@ -655,7 +1154,7 @@ struct vdec_context final
 							{
 								std::lock_guard lock{mutex};
 
-								if (out_queue.size() <= out_max)
+								if (out_queue.size() <= get_output_queue_limit())
 								{
 									break;
 								}
@@ -665,7 +1164,7 @@ struct vdec_context final
 
 							if (elapsed++ >= 500) // 5 seconds
 							{
-								cellVdec.error("Video au decode has been waiting for a consumer for 5 seconds. (handle=0x%x, seq_id=%d, cmd_id=%d, queue_size=%d)", handle, cmd->seq_id, cmd->id, out_queue.size());
+								cellVdec.error("Video au decode has been waiting for a consumer for 5 seconds. (handle=0x%x, seq_id=%d, cmd_id=%d, queue_size=%d, queue_limit=%d)", handle, cmd->seq_id, cmd->id, out_queue.size(), get_output_queue_limit());
 								elapsed = 0;
 							}
 						}
@@ -705,6 +1204,13 @@ struct vdec_context final
 			}
 			case vdec_cmd_type::close:
 			{
+				if (!mpeg2_filter.active_filter_name.empty())
+				{
+					cellVdec.notice("Closing host MPEG-2 enhancement path '%s' with inputs=%llu, outputs=%llu.", mpeg2_filter.active_filter_name, mpeg2_filter.queued_inputs, mpeg2_filter.emitted_outputs);
+				}
+
+				mpeg2_filter.reset();
+
 				std::lock_guard lock{mutex};
 				out_queue.clear();
 				break;
@@ -1407,7 +1913,7 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 		sequence_id = vdec->seq_id;
 
 		vdec->out_queue.pop_front();
-		if (vdec->out_queue.size() + 1 == vdec->out_max)
+		if (vdec->out_queue.size() + 1 == vdec->get_output_queue_limit())
 			notify = true;
 	}
 

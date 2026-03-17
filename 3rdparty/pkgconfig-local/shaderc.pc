@@ -1,0 +1,13 @@
+prefix=C:/Projects/vcpkg/installed/x64-win-llvm-static-release
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: shaderc
+Description: Tools and libraries for Vulkan shader compilation
+Version: 2025.2
+URL: https://github.com/google/shaderc
+
+# Match the static link closure used by the vcpkg shaderc/glslang packages.
+Libs: -L${libdir} -lshaderc -lshaderc_util -lglslang -lglslang-default-resource-limits -lMachineIndependent -lGenericCodeGen -lOSDependent -lSPIRV -lSPIRV-Tools-opt -lSPIRV-Tools
+Cflags: -I${includedir}
