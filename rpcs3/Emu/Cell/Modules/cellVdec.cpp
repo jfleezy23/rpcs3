@@ -645,8 +645,16 @@ struct vdec_frame
 		{
 			std::string filter_desc = "libplacebo=deinterlace=bob";
 			filter_desc += ":send_fields=1";
+			filter_desc += ":fps=";
+			filter_desc += fps_arg;
+			filter_desc += ":frame_mixer=oversample";
+			filter_desc += ":deband=1";
+			filter_desc += ":deband_iterations=1";
+			filter_desc += ":deband_radius=4";
+			filter_desc += ":deband_threshold=3";
+			filter_desc += ":deband_grain=2";
 
-			if (try_filter("libplacebo-bob-fast", filter_desc))
+			if (try_filter("libplacebo-bob-smooth", filter_desc))
 			{
 				return true;
 			}
@@ -654,8 +662,16 @@ struct vdec_frame
 			filter_desc = "libplacebo=deinterlace=yadif";
 			filter_desc += ":skip_spatial_check=1";
 			filter_desc += ":send_fields=1";
+			filter_desc += ":fps=";
+			filter_desc += fps_arg;
+			filter_desc += ":frame_mixer=mitchell_clamp";
+			filter_desc += ":deband=1";
+			filter_desc += ":deband_iterations=2";
+			filter_desc += ":deband_radius=6";
+			filter_desc += ":deband_threshold=4";
+			filter_desc += ":deband_grain=3";
 
-			if (try_filter("libplacebo-yadif-fast", filter_desc))
+			if (try_filter("libplacebo-yadif-smooth", filter_desc))
 			{
 				return true;
 			}
